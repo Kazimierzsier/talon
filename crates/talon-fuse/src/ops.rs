@@ -328,6 +328,7 @@ impl ReadOnlyFs {
 
     /// `lookup`: resolve a child `name` under directory `parent_ino`.
     pub fn lookup(&self, parent_ino: u64, name: &str) -> Result<Attr, FsError> {
+        Self::validate_name_length(name)?;
         let g = self.inner.lock_recover();
         let ino = *g
             .index
@@ -795,10 +796,17 @@ impl ReadOnlyFs {
     }
 
     fn validate_component(name: &str) -> Result<(), FsError> {
+        Self::validate_name_length(name)?;
+        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+            Err(FsError::Invalid)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn validate_name_length(name: &str) -> Result<(), FsError> {
         if name.len() > 255 {
             Err(FsError::NameTooLong)
-        } else if name.is_empty() || name == "." || name == ".." || name.contains('/') {
-            Err(FsError::Invalid)
         } else {
             Ok(())
         }
@@ -990,6 +998,7 @@ mod tests {
             fs.new_directory_marker_path(parent.ino, &name),
             Err(FsError::NameTooLong)
         );
+        assert_eq!(fs.lookup(parent.ino, &name), Err(FsError::NameTooLong));
         assert_eq!(fs.mkdir(parent.ino, &name), Err(FsError::NameTooLong));
         assert_eq!(
             fs.rmdir_marker_path(parent.ino, &name),
