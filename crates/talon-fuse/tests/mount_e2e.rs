@@ -26,10 +26,12 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
+use std::os::unix::process::CommandExt;
+use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use talon_core::{NodeId, NodeInfo, NodeRole};
@@ -137,6 +139,7 @@ async fn spawn_coordinator(worker_addr: String) -> String {
 async fn mount_read_is_byte_exact_through_the_kernel() {
     use fuser::MountOption;
 
+    let _mount_test_guard = serialize_mount_test().await;
     let file_size: u64 = 3 * 1024 * 1024; // 3 MiB, spans several 1 MiB reads.
     let block_size: u32 = 4 * 1024 * 1024; // one block covers the whole file.
 
@@ -208,6 +211,13 @@ async fn mount_read_is_byte_exact_through_the_kernel() {
 
 /// Shared object store for the read-write mock worker: object path → bytes.
 type Store = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+
+async fn serialize_mount_test() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
 
 /// Spawn a mock worker that honours the full data plane: `Put` writes an object
 /// into the shared store (replying with a committed version), `Delete` removes
@@ -289,6 +299,7 @@ async fn spawn_rw_worker(store: Store) -> String {
 async fn mount_write_through_is_visible_in_backend() {
     use fuser::MountOption;
 
+    let _mount_test_guard = serialize_mount_test().await;
     let block_size: u32 = 4 * 1024 * 1024;
     let store: Store = Arc::new(Mutex::new(HashMap::new()));
     let worker = spawn_rw_worker(Arc::clone(&store)).await;
@@ -375,6 +386,7 @@ async fn mount_write_through_is_visible_in_backend() {
 async fn mount_open_flags_preserve_and_replace_blob_contents() {
     use fuser::MountOption;
 
+    let _mount_test_guard = serialize_mount_test().await;
     let block_size: u32 = 4 * 1024 * 1024;
     let store: Store = Arc::new(Mutex::new(HashMap::from([(
         "/s3/bucket/existing.bin".to_string(),
@@ -490,6 +502,7 @@ async fn mount_open_flags_preserve_and_replace_blob_contents() {
 async fn mount_directory_markers_are_written_through() {
     use fuser::MountOption;
 
+    let _mount_test_guard = serialize_mount_test().await;
     let block_size: u32 = 4 * 1024 * 1024;
     let store: Store = Arc::new(Mutex::new(HashMap::new()));
     let worker = spawn_rw_worker(Arc::clone(&store)).await;
@@ -600,6 +613,7 @@ async fn mount_directory_markers_are_written_through() {
 async fn mount_truncate_and_ftruncate_are_written_through() {
     use fuser::MountOption;
 
+    let _mount_test_guard = serialize_mount_test().await;
     let block_size: u32 = 4 * 1024 * 1024;
     let store: Store = Arc::new(Mutex::new(HashMap::from([(
         "/s3/bucket/data.bin".to_string(),
@@ -700,6 +714,7 @@ async fn mount_truncate_and_ftruncate_are_written_through() {
 async fn mount_regular_file_rename_is_written_through() {
     use fuser::MountOption;
 
+    let _mount_test_guard = serialize_mount_test().await;
     let block_size: u32 = 4 * 1024 * 1024;
     let store: Store = Arc::new(Mutex::new(HashMap::from([
         ("/s3/bucket/source.bin".to_string(), b"source".to_vec()),
@@ -793,6 +808,7 @@ async fn mount_regular_file_rename_is_written_through() {
 async fn mount_directory_tree_rename_is_written_through() {
     use fuser::MountOption;
 
+    let _mount_test_guard = serialize_mount_test().await;
     let block_size: u32 = 4 * 1024 * 1024;
     let store: Store = Arc::new(Mutex::new(HashMap::from([
         ("/s3/bucket/tree/".to_string(), Vec::new()),
@@ -937,6 +953,7 @@ async fn mount_directory_tree_rename_is_written_through() {
 async fn mount_unlink_preserves_open_descriptors_without_recreating_the_name() {
     use fuser::MountOption;
 
+    let _mount_test_guard = serialize_mount_test().await;
     let block_size: u32 = 4 * 1024 * 1024;
     let store: Store = Arc::new(Mutex::new(HashMap::from([(
         "/s3/bucket/live.bin".to_string(),
@@ -1056,6 +1073,7 @@ async fn mount_unlink_preserves_open_descriptors_without_recreating_the_name() {
 async fn mount_symbolic_links_are_written_through() {
     use fuser::MountOption;
 
+    let _mount_test_guard = serialize_mount_test().await;
     let block_size: u32 = 4 * 1024 * 1024;
     let store: Store = Arc::new(Mutex::new(HashMap::from([(
         "/s3/bucket/target.bin".to_string(),
@@ -1173,6 +1191,7 @@ async fn mount_symbolic_links_are_written_through() {
 async fn mount_hard_links_share_inode_and_backend_contents() {
     use fuser::MountOption;
 
+    let _mount_test_guard = serialize_mount_test().await;
     let block_size: u32 = 4 * 1024 * 1024;
     let store: Store = Arc::new(Mutex::new(HashMap::from([
         ("/s3/bucket/source.bin".to_string(), b"seed".to_vec()),
@@ -1311,7 +1330,7 @@ async fn mount_hard_links_share_inode_and_backend_contents() {
         assert_eq!(retained, b"ne");
         drop(final_handle);
 
-        for _ in 0..100 {
+        for _ in 0..1_000 {
             let has_orphan = operation_store
                 .lock()
                 .unwrap()
@@ -1346,6 +1365,7 @@ async fn mount_hard_links_share_inode_and_backend_contents() {
 async fn mount_timestamp_updates_follow_utimens_semantics() {
     use fuser::MountOption;
 
+    let _mount_test_guard = serialize_mount_test().await;
     let block_size: u32 = 4 * 1024 * 1024;
     let store: Store = Arc::new(Mutex::new(HashMap::from([(
         "/s3/bucket/file.bin".to_string(),
@@ -1354,7 +1374,10 @@ async fn mount_timestamp_updates_follow_utimens_semantics() {
     let worker = spawn_rw_worker(Arc::clone(&store)).await;
     let coord = spawn_coordinator(worker).await;
 
-    let fs = Arc::new(ReadOnlyFs::new());
+    let fs = Arc::new(ReadOnlyFs::new_with_owner(
+        unsafe { libc::geteuid() },
+        unsafe { libc::getegid() },
+    ));
     fs.insert_object("s3/bucket/file.bin", 4);
 
     let cache = Arc::new(PlacementCache::new(10_000));
@@ -1465,6 +1488,7 @@ async fn mount_timestamp_updates_follow_utimens_semantics() {
 async fn mount_special_nodes_are_namespace_only() {
     use fuser::MountOption;
 
+    let _mount_test_guard = serialize_mount_test().await;
     let block_size: u32 = 4 * 1024 * 1024;
     let store: Store = Arc::new(Mutex::new(HashMap::from([(
         "/s3/bucket/placeholder".to_string(),
@@ -1598,6 +1622,7 @@ async fn mount_special_nodes_are_namespace_only() {
 async fn mount_device_nodes_preserve_rdev() {
     use fuser::MountOption;
 
+    let _mount_test_guard = serialize_mount_test().await;
     if std::env::var_os("TALON_TEST_DEVICE_NODES").is_none() {
         return;
     }
@@ -1673,4 +1698,128 @@ async fn mount_device_nodes_preserve_rdev() {
     drop(session);
     std::fs::remove_dir_all(&mountpoint).ok();
     result.expect("exercise block and character device nodes through mount");
+}
+
+/// Exercise ownership and mode enforcement with real non-root request IDs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires privileged /dev/fuse and TALON_TEST_MULTIUSER=1"]
+async fn mount_metadata_enforces_multiuser_permissions() {
+    use fuser::MountOption;
+
+    let _mount_test_guard = serialize_mount_test().await;
+    if std::env::var_os("TALON_TEST_MULTIUSER").is_none() {
+        return;
+    }
+    let block_size: u32 = 4 * 1024 * 1024;
+    let store: Store = Arc::new(Mutex::new(HashMap::from([(
+        "/s3/bucket/placeholder".to_string(),
+        Vec::new(),
+    )])));
+    let worker = spawn_rw_worker(Arc::clone(&store)).await;
+    let coord = spawn_coordinator(worker).await;
+    let fs = Arc::new(ReadOnlyFs::new());
+    fs.insert_object("s3/bucket/placeholder", 0);
+
+    let cache = Arc::new(PlacementCache::new(10_000));
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
+    let adapter = TalonFuse::new(
+        Arc::clone(&fs),
+        reader,
+        tokio::runtime::Handle::current(),
+        block_size,
+        talon_core::Version::new(talon_fuse::mount::CANONICAL_MOUNT_VERSION),
+    )
+    .with_read_write(true);
+
+    let mountpoint =
+        std::env::temp_dir().join(format!("talon-mount-e2e-metadata-{}", std::process::id()));
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    let options = vec![
+        MountOption::FSName("talon".into()),
+        MountOption::DefaultPermissions,
+        MountOption::AllowOther,
+    ];
+    let session = fuser::spawn_mount2(adapter, &mountpoint, &options)
+        .expect("multi-user metadata test requires an allow_other FUSE mount");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let test_dir = mountpoint.join("s3").join("bucket").join("multiuser");
+    std::fs::create_dir(&test_dir).unwrap();
+    std::fs::set_permissions(&test_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let result = tokio::task::spawn_blocking(move || {
+        let owned = test_dir.join("owned.bin");
+        let script = format!(
+            "umask 027; : > '{}'; chmod 6750 '{}'",
+            owned.display(),
+            owned.display()
+        );
+        let mut create = Command::new("/bin/sh");
+        create.arg("-c").arg(script);
+        unsafe {
+            create.pre_exec(|| {
+                if libc::setgid(65_534) != 0 || libc::setuid(65_534) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        assert!(create.status()?.success());
+
+        let created = std::fs::metadata(&owned)?;
+        assert_eq!(created.uid(), 65_534);
+        assert_eq!(created.gid(), 65_534);
+        assert_eq!(created.mode() & 0o7777, 0o6750);
+
+        let result = unsafe {
+            libc::chown(
+                std::ffi::CString::new(owned.as_os_str().as_bytes())
+                    .unwrap()
+                    .as_ptr(),
+                65_533,
+                65_532,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let changed = std::fs::metadata(&owned)?;
+        assert_eq!(changed.uid(), 65_533);
+        assert_eq!(changed.gid(), 65_532);
+        assert_eq!(changed.mode() & 0o6000, 0);
+
+        let script = format!("chmod 0600 '{}'", owned.display());
+        let mut denied = Command::new("/bin/sh");
+        denied.arg("-c").arg(script);
+        unsafe {
+            denied.pre_exec(|| {
+                if libc::setgid(65_534) != 0 || libc::setuid(65_534) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        assert!(!denied.status()?.success());
+
+        std::fs::set_permissions(&test_dir, std::fs::Permissions::from_mode(0o755))?;
+        let blocked = test_dir.join("blocked.bin");
+        let script = format!(": > '{}'", blocked.display());
+        let mut create_denied = Command::new("/bin/sh");
+        create_denied.arg("-c").arg(script);
+        unsafe {
+            create_denied.pre_exec(|| {
+                if libc::setgid(65_534) != 0 || libc::setuid(65_534) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        assert!(!create_denied.status()?.success());
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .unwrap();
+
+    drop(session);
+    std::fs::remove_dir_all(&mountpoint).ok();
+    result.expect("exercise multi-user metadata through mount");
 }
