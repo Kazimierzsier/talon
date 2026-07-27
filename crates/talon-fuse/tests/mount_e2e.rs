@@ -23,11 +23,11 @@
 #![cfg(feature = "mount")]
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{Read, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use talon_core::{NodeId, NodeInfo, NodeRole};
@@ -36,7 +36,7 @@ use talon_fuse::{BlockReader, CoordinatorClient, PlacementCache, ReadOnlyFs};
 use talon_transport::data;
 use talon_transport::frame::{FrameHeader, MsgType, HEADER_LEN};
 use talon_transport::{decode_request, response_header_ok, ControlMessage, RangeRequest};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 /// Deterministic content byte for an absolute object offset.
@@ -204,8 +204,21 @@ async fn mount_read_is_byte_exact_through_the_kernel() {
     );
 }
 
-/// Shared object store for the read-write mock worker: object path → bytes.
-type Store = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+#[derive(Clone)]
+struct StoredObject {
+    file: Arc<tempfile::NamedTempFile>,
+    len: u64,
+}
+
+/// Shared sparse-file object store for the read-write mock worker.
+type Store = Arc<Mutex<HashMap<String, StoredObject>>>;
+
+async fn serialize_mount_test() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
 
 /// Spawn a mock worker that honours the full data plane: `Put` writes an object
 /// into the shared store (replying with a committed version), `Delete` removes
@@ -238,9 +251,30 @@ async fn spawn_rw_worker(store: Store) -> String {
                     match h.msg_type {
                         MsgType::Put => {
                             let (ph, req) = data::decode_put_header(&full).unwrap();
-                            let mut obj = vec![0u8; req.body_len as usize];
-                            sock.read_exact(&mut obj).await.unwrap();
-                            store.lock().unwrap().insert(req.object.to_path(), obj);
+                            let staged = tempfile::NamedTempFile::new().unwrap();
+                            let mut output = tokio::fs::File::from_std(staged.reopen().unwrap());
+                            let mut remaining = req.body_len;
+                            let mut chunk = vec![0u8; 8 * 1024 * 1024];
+                            while remaining > 0 {
+                                let count = remaining.min(chunk.len() as u64) as usize;
+                                sock.read_exact(&mut chunk[..count]).await.unwrap();
+                                if chunk[..count].iter().all(|byte| *byte == 0) {
+                                    output.seek(SeekFrom::Current(count as i64)).await.unwrap();
+                                } else {
+                                    output.write_all(&chunk[..count]).await.unwrap();
+                                }
+                                remaining -= count as u64;
+                            }
+                            output.set_len(req.body_len).await.unwrap();
+                            output.flush().await.unwrap();
+                            drop(output);
+                            store.lock().unwrap().insert(
+                                req.object.to_path(),
+                                StoredObject {
+                                    file: Arc::new(staged),
+                                    len: req.body_len,
+                                },
+                            );
                             let version = b"v-written";
                             let out = data::response_header_ok(ph.request_id, version.len() as u32);
                             sock.write_all(&out).await.unwrap();
@@ -257,15 +291,18 @@ async fn spawn_rw_worker(store: Store) -> String {
                         _ => {
                             let (_h, req): (_, RangeRequest) = decode_request(&full).unwrap();
                             let stored = store.lock().unwrap().get(&req.object.to_path()).cloned();
-                            let payload: Vec<u8> = (0..req.len)
-                                .map(|i| {
-                                    let abs = (req.offset + i) as usize;
+                            let mut payload = vec![0u8; req.len as usize];
+                            if let Some(stored) = stored {
+                                let available =
+                                    stored.len.saturating_sub(req.offset).min(req.len) as usize;
+                                if available > 0 {
                                     stored
-                                        .as_ref()
-                                        .and_then(|b| b.get(abs).copied())
-                                        .unwrap_or(0)
-                                })
-                                .collect();
+                                        .file
+                                        .as_file()
+                                        .read_exact_at(&mut payload[..available], req.offset)
+                                        .unwrap();
+                                }
+                            }
                             let mut out = response_header_ok(0, payload.len() as u32).to_vec();
                             out.extend_from_slice(&payload);
                             sock.write_all(&out).await.unwrap();
@@ -365,6 +402,91 @@ async fn mount_write_through_is_visible_in_backend() {
         !final_store.contains_key("s3/bucket/hello.bin"),
         "object should be gone from backend after unlink"
     );
+}
+
+/// Spill a sparse write past the memory threshold and stream it through close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires /dev/fuse; run with --features mount -- --ignored"]
+async fn mount_large_sparse_write_streams_without_whole_object_memory() {
+    use fuser::MountOption;
+
+    let _mount_test_guard = serialize_mount_test().await;
+    let block_size: u32 = 4 * 1024 * 1024;
+    let store: Store = Arc::new(Mutex::new(HashMap::new()));
+    let worker = spawn_rw_worker(Arc::clone(&store)).await;
+    let coord = spawn_coordinator(worker).await;
+
+    let fs = Arc::new(ReadOnlyFs::new().with_max_object_bytes(1024));
+    fs.insert_object("s3/bucket/placeholder", 0);
+    let cache = Arc::new(PlacementCache::new(10_000));
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
+    let adapter = TalonFuse::new(
+        Arc::clone(&fs),
+        reader,
+        tokio::runtime::Handle::current(),
+        block_size,
+        talon_core::Version::new(talon_fuse::mount::CANONICAL_MOUNT_VERSION),
+    )
+    .with_read_write(true);
+
+    let require_fuse = std::env::var_os("TALON_REQUIRE_FUSE").is_some();
+    let mountpoint =
+        std::env::temp_dir().join(format!("talon-mount-e2e-stream-{}", std::process::id()));
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    let session =
+        match fuser::spawn_mount2(adapter, &mountpoint, &[MountOption::FSName("talon".into())]) {
+            Ok(session) => session,
+            Err(error) => {
+                std::fs::remove_dir_all(&mountpoint).ok();
+                if require_fuse {
+                    panic!("TALON_REQUIRE_FUSE is set but the FUSE mount failed: {error}");
+                }
+                eprintln!("skipping: /dev/fuse unavailable: {error}");
+                return;
+            }
+        };
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let path = mountpoint.join("s3").join("bucket").join("sparse.bin");
+    let write_path = path.clone();
+    let logical_offset = 8 * 1024 * 1024 + 1;
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&write_path)?;
+        assert_eq!(file.write_at(b"x", logical_offset)?, 1);
+        drop(file);
+
+        assert_eq!(std::fs::metadata(&write_path)?.len(), logical_offset + 1);
+        let file = std::fs::File::open(&write_path)?;
+        let mut byte = [0u8; 1];
+        assert_eq!(file.read_at(&mut byte, logical_offset)?, 1);
+        assert_eq!(byte, [b'x']);
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .unwrap()
+    .expect("stream a sparse write through the mount");
+
+    drop(session);
+    std::fs::remove_dir_all(&mountpoint).ok();
+
+    let stored = store
+        .lock()
+        .unwrap()
+        .get("/s3/bucket/sparse.bin")
+        .cloned()
+        .expect("mock backend received streamed object");
+    assert_eq!(stored.len, logical_offset + 1);
+    let mut byte = [0u8; 1];
+    stored
+        .file
+        .as_file()
+        .read_exact_at(&mut byte, logical_offset)
+        .unwrap();
+    assert_eq!(byte, [b'x']);
 }
 
 /// Mount the read-write fixture and run the pinned pjdfstest suite against it.
@@ -545,8 +667,8 @@ async fn mount_kernel_io_benchmark() {
             .lock()
             .unwrap()
             .get("/s3/bucket/bench-write.bin")
-            .map(Vec::len),
-        Some(write_size as usize),
+            .map(|object| object.len),
+        Some(write_size),
         "benchmark write must reach the mock backend"
     );
 }
