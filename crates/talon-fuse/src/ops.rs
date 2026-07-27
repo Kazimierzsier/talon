@@ -66,7 +66,19 @@ pub enum FsError {
     NotEmpty,
     /// A pathname component exceeds the filesystem name limit (`ENAMETOOLONG`).
     NameTooLong,
+    /// The write would grow a buffered object past the allowed maximum, or the
+    /// requested offset is not representable (`EFBIG`).
+    TooLarge,
 }
+
+/// Default cap on a single in-memory write buffer (1 GiB).
+///
+/// v1 buffers a whole object in RAM, so the buffer length is attacker-reachable
+/// from an unprivileged `pwrite`/`ftruncate` at an arbitrary offset. Without a
+/// cap, `pwrite(fd, buf, 1, 1<<40)` asks for a 1 TiB zero-filled allocation and
+/// takes the mount (and likely the host) down. See
+/// [`ReadOnlyFs::with_max_object_bytes`] to tune.
+pub const DEFAULT_MAX_OBJECT_BYTES: u64 = 1 << 30;
 
 /// Access and mutation behavior for an open file handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +137,8 @@ struct Node {
 /// directories is created on demand.
 pub struct ReadOnlyFs {
     inner: Mutex<Inner>,
+    /// Cap on the length of any single write handle's in-memory buffer.
+    max_object_bytes: u64,
 }
 
 struct Inner {
@@ -192,7 +206,21 @@ impl ReadOnlyFs {
                 next_fh: 1,
                 dirty: HashMap::new(),
             }),
+            max_object_bytes: DEFAULT_MAX_OBJECT_BYTES,
         }
+    }
+
+    /// Override the per-object write-buffer cap (see
+    /// [`DEFAULT_MAX_OBJECT_BYTES`]). Writes or truncates that would push a
+    /// buffer past this fail with [`FsError::TooLarge`] (`EFBIG`).
+    pub fn with_max_object_bytes(mut self, max: u64) -> Self {
+        self.max_object_bytes = max;
+        self
+    }
+
+    /// The configured per-object write-buffer cap.
+    pub fn max_object_bytes(&self) -> u64 {
+        self.max_object_bytes
     }
 
     /// Register an object at `path` (e.g. `/s3/bucket/a/b/file.bin`) with `size`,
@@ -586,7 +614,12 @@ impl ReadOnlyFs {
     /// Random-offset writes land by position; a write past the current end
     /// extends the buffer with zeros (sparse). Updates the node's visible size.
     /// Returns the number of bytes written. Fails with [`FsError::BadHandle`] for
-    /// a handle not opened for write.
+    /// a handle not opened for write, or [`FsError::TooLarge`] (`EFBIG`) if the
+    /// resulting buffer would exceed [`ReadOnlyFs::max_object_bytes`].
+    ///
+    /// The end offset is computed with a checked add: `offset` comes straight
+    /// from the kernel and `offset + len` would otherwise overflow `usize` (a
+    /// debug panic under the global lock, a wrap in release).
     pub fn write(&self, fh: u64, offset: u64, data: &[u8]) -> Result<u32, FsError> {
         let mut g = self.inner.lock_recover();
         let handle = g.handles.get(&fh).ok_or(FsError::BadHandle)?;
@@ -594,19 +627,32 @@ impl ReadOnlyFs {
             return Err(FsError::BadHandle);
         }
         let append = handle.append;
-        let dirty = g.dirty.get_mut(&fh).ok_or(FsError::BadHandle)?;
         let start = if append {
-            dirty.buf.len()
+            g.dirty
+                .get(&fh)
+                .ok_or(FsError::BadHandle)?
+                .buf
+                .len() as u64
         } else {
-            usize::try_from(offset).map_err(|_| FsError::Invalid)?
+            offset
         };
-        let end = start.checked_add(data.len()).ok_or(FsError::Invalid)?;
+        let end = start
+            .checked_add(data.len() as u64)
+            .ok_or(FsError::TooLarge)?;
+        if end > self.max_object_bytes {
+            return Err(FsError::TooLarge);
+        }
+        // Past the cap check, `end` fits in u64 and is bounded; on a 32-bit host
+        // it may still exceed usize, which is a legitimate EFBIG.
+        let end: usize = end.try_into().map_err(|_| FsError::TooLarge)?;
+        let start: usize = start.try_into().map_err(|_| FsError::TooLarge)?;
+        let dirty = g.dirty.get_mut(&fh).ok_or(FsError::BadHandle)?;
         if dirty.buf.len() < end {
             dirty.buf.resize(end, 0);
         }
         dirty.buf[start..end].copy_from_slice(data);
         let ino = dirty.ino;
-        let new_size = g.dirty.get(&fh).unwrap().buf.len() as u64;
+        let new_size = dirty.buf.len() as u64;
         if let Some(node) = g.nodes.get_mut(&ino) {
             node.size = node.size.max(new_size);
         }
@@ -614,15 +660,22 @@ impl ReadOnlyFs {
     }
 
     /// `setattr(size)`: truncate/extend the write handle's buffer to `size`.
+    ///
+    /// Fails with [`FsError::TooLarge`] (`EFBIG`) if `size` exceeds
+    /// [`ReadOnlyFs::max_object_bytes`] — `ftruncate` takes an arbitrary
+    /// user-supplied length and the buffer is zero-filled eagerly.
     pub fn truncate(&self, fh: u64, size: u64) -> Result<(), FsError> {
         let mut g = self.inner.lock_recover();
         let handle = g.handles.get(&fh).ok_or(FsError::BadHandle)?;
         if !handle.write {
             return Err(FsError::BadHandle);
         }
+        if size > self.max_object_bytes {
+            return Err(FsError::TooLarge);
+        }
+        let new_len: usize = size.try_into().map_err(|_| FsError::TooLarge)?;
         let dirty = g.dirty.get_mut(&fh).ok_or(FsError::BadHandle)?;
-        let buffer_size = usize::try_from(size).map_err(|_| FsError::Invalid)?;
-        dirty.buf.resize(buffer_size, 0);
+        dirty.buf.resize(new_len, 0);
         let ino = dirty.ino;
         if let Some(node) = g.nodes.get_mut(&ino) {
             node.size = size;
@@ -1228,5 +1281,84 @@ mod tests {
         assert_eq!(fs.write(fh, 0, b"ok").unwrap(), 2);
         assert_eq!(fs.dirty_bytes(fh).unwrap(), b"ok");
         fs.release(fh).unwrap();
+    }
+
+    /// Regression: `offset` comes from the kernel unvalidated, so a single
+    /// `pwrite` at a huge offset used to ask for a proportionally huge
+    /// zero-filled allocation (`buf.resize(offset + len)`) — a one-syscall DoS
+    /// of the whole mount. It is now bounded by `max_object_bytes`.
+    #[test]
+    fn write_past_the_cap_is_efbig_and_allocates_nothing() {
+        let fs = ReadOnlyFs::new().with_max_object_bytes(1024);
+        let (attr, fh) = fs.create(ROOT_INO, "big.bin").unwrap();
+
+        // 1 TiB offset: would have been a 1 TiB resize.
+        assert_eq!(fs.write(fh, 1 << 40, b"x"), Err(FsError::TooLarge));
+        // Just past the cap.
+        assert_eq!(fs.write(fh, 1024, b"x"), Err(FsError::TooLarge));
+        // Straddling the cap.
+        assert_eq!(fs.write(fh, 1020, b"12345"), Err(FsError::TooLarge));
+
+        // Nothing was buffered and the visible size never moved.
+        assert!(fs.dirty_bytes(fh).unwrap().is_empty());
+        assert_eq!(fs.getattr(attr.ino).unwrap().size, 0);
+
+        // Exactly at the cap still succeeds.
+        assert_eq!(fs.write(fh, 1023, b"x").unwrap(), 1);
+        assert_eq!(fs.dirty_bytes(fh).unwrap().len(), 1024);
+    }
+
+    /// `offset + data.len()` overflowed `usize`: a debug panic while holding the
+    /// global mutex (poisoning it and bricking every later op), a silent wrap in
+    /// release. It is now a checked add.
+    #[test]
+    fn write_offset_overflow_is_efbig_not_a_panic() {
+        let fs = ReadOnlyFs::new();
+        let (_, fh) = fs.create(ROOT_INO, "ovf.bin").unwrap();
+        assert_eq!(fs.write(fh, u64::MAX, b"xyz"), Err(FsError::TooLarge));
+        assert_eq!(fs.write(fh, u64::MAX - 1, b"xyz"), Err(FsError::TooLarge));
+        // The filesystem is still usable afterwards (no poisoned lock).
+        assert_eq!(fs.write(fh, 0, b"ok").unwrap(), 2);
+        assert_eq!(fs.dirty_bytes(fh).unwrap(), b"ok");
+    }
+
+    /// `truncate -s 1P file` reached `buf.resize(size)` directly.
+    #[test]
+    fn truncate_past_the_cap_is_efbig() {
+        let fs = ReadOnlyFs::new().with_max_object_bytes(1024);
+        let (attr, fh) = fs.create(ROOT_INO, "t.bin").unwrap();
+        fs.write(fh, 0, b"seed").unwrap();
+
+        assert_eq!(fs.truncate(fh, 1 << 50), Err(FsError::TooLarge));
+        assert_eq!(fs.truncate(fh, 1025), Err(FsError::TooLarge));
+        // Untouched by the rejected calls.
+        assert_eq!(fs.dirty_bytes(fh).unwrap(), b"seed");
+        assert_eq!(fs.getattr(attr.ino).unwrap().size, 4);
+
+        // At the cap is fine.
+        fs.truncate(fh, 1024).unwrap();
+        assert_eq!(fs.dirty_bytes(fh).unwrap().len(), 1024);
+    }
+
+    /// A bad handle is EBADF regardless of how absurd the size argument is.
+    #[test]
+    fn bad_handle_outranks_the_size_check() {
+        let fs = ReadOnlyFs::new().with_max_object_bytes(16);
+        assert_eq!(fs.write(9999, 1 << 40, b"x"), Err(FsError::BadHandle));
+        assert_eq!(fs.truncate(9999, 1 << 40), Err(FsError::BadHandle));
+    }
+
+    #[test]
+    fn default_cap_is_applied_and_overridable() {
+        assert_eq!(
+            ReadOnlyFs::new().max_object_bytes(),
+            DEFAULT_MAX_OBJECT_BYTES
+        );
+        assert_eq!(
+            ReadOnlyFs::new()
+                .with_max_object_bytes(7)
+                .max_object_bytes(),
+            7
+        );
     }
 }

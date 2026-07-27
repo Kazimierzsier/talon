@@ -62,6 +62,7 @@ pub(crate) fn errno(err: FsError) -> i32 {
         FsError::Invalid => libc::EINVAL,
         FsError::NotEmpty => libc::ENOTEMPTY,
         FsError::NameTooLong => libc::ENAMETOOLONG,
+        FsError::TooLarge => libc::EFBIG,
     }
 }
 
@@ -1033,6 +1034,7 @@ mod tests {
         assert_eq!(errno(FsError::Invalid), libc::EINVAL);
         assert_eq!(errno(FsError::NotEmpty), libc::ENOTEMPTY);
         assert_eq!(errno(FsError::NameTooLong), libc::ENAMETOOLONG);
+        assert_eq!(errno(FsError::TooLarge), libc::EFBIG);
     }
 
     #[test]
