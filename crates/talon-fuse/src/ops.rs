@@ -14,6 +14,7 @@
 //! object is written through to the backend at flush.
 
 use crate::lock::MutexExt;
+use crate::mapping::path_to_object;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -53,6 +54,39 @@ pub enum FsError {
     Unsupported,
     /// A read used a bad handle (`EBADF`).
     BadHandle,
+    /// A file-only operation targeted a directory (`EISDIR`).
+    IsDir,
+    /// A directory was required but another node type was found (`ENOTDIR`).
+    NotDir,
+    /// The target name already exists (`EEXIST`).
+    Exists,
+    /// An invalid flag, name, path, or argument was supplied (`EINVAL`).
+    Invalid,
+}
+
+/// Access and mutation behavior for an open file handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenOptions {
+    /// Permit reads through the handle.
+    pub read: bool,
+    /// Permit writes through the handle.
+    pub write: bool,
+    /// Force each write to the current end of the file.
+    pub append: bool,
+}
+
+/// Data source for a read through an open handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadSource {
+    /// Read from an in-progress whole-object write buffer.
+    Buffered(Vec<u8>),
+    /// Read the committed object from the backend.
+    Backend {
+        /// Mount-relative object path.
+        path: String,
+        /// Current object size.
+        size: u64,
+    },
 }
 
 /// A directory entry yielded by `readdir`.
@@ -92,8 +126,8 @@ struct Inner {
     // (parent_ino, name) -> child_ino for O(1) lookup.
     index: HashMap<(u64, String), u64>,
     next_ino: u64,
-    // Open file handles -> the inode they reference.
-    handles: HashMap<u64, u64>,
+    // Open file handles -> inode and access mode.
+    handles: HashMap<u64, Handle>,
     next_fh: u64,
     // Write handles -> their in-progress whole-object buffer. A handle opened for
     // write accumulates bytes here (random-offset writes land by position); the
@@ -101,6 +135,14 @@ struct Inner {
     // backend (#226/#231). v1 buffers in memory (objects are single-block/small);
     // a temp-file-backed buffer for large objects is future work.
     dirty: HashMap<u64, DirtyFile>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Handle {
+    ino: u64,
+    read: bool,
+    write: bool,
+    append: bool,
 }
 
 /// A per-write-handle whole-object buffer.
@@ -253,17 +295,58 @@ impl ReadOnlyFs {
         Ok(entries)
     }
 
-    /// `open`: obtain a read handle for a file inode. Directories are rejected.
-    pub fn open(&self, ino: u64) -> Result<u64, FsError> {
+    /// Open an existing file with the requested access mode.
+    ///
+    /// Writable handles use `initial_contents` as their whole-object working
+    /// copy. A truncating open passes an empty vector; a non-truncating open
+    /// passes bytes read from the committed backend object.
+    pub fn open_with_options(
+        &self,
+        ino: u64,
+        options: OpenOptions,
+        initial_contents: Option<Vec<u8>>,
+    ) -> Result<u64, FsError> {
+        if !options.read && !options.write {
+            return Err(FsError::Invalid);
+        }
         let mut g = self.inner.lock_recover();
         let kind = g.nodes.get(&ino).ok_or(FsError::NotFound)?.kind;
         if kind != FileKind::File {
-            return Err(FsError::Unsupported);
+            return Err(FsError::IsDir);
+        }
+        if options.write && initial_contents.is_none() {
+            return Err(FsError::Invalid);
         }
         let fh = g.next_fh;
         g.next_fh += 1;
-        g.handles.insert(fh, ino);
+        g.handles.insert(
+            fh,
+            Handle {
+                ino,
+                read: options.read,
+                write: options.write,
+                append: options.append,
+            },
+        );
+        if let Some(buf) = initial_contents {
+            g.dirty.insert(fh, DirtyFile { ino, buf });
+            let size = g.dirty.get(&fh).unwrap().buf.len() as u64;
+            g.nodes.get_mut(&ino).unwrap().size = size;
+        }
         Ok(fh)
+    }
+
+    /// Open an existing file read-only.
+    pub fn open(&self, ino: u64) -> Result<u64, FsError> {
+        self.open_with_options(
+            ino,
+            OpenOptions {
+                read: true,
+                write: false,
+                append: false,
+            },
+            None,
+        )
     }
 
     /// `release`: drop a previously opened handle (read or write), discarding any
@@ -288,10 +371,45 @@ impl ReadOnlyFs {
     /// [`FsError::Unsupported`] if the handle somehow references a directory.
     pub fn file_meta(&self, fh: u64) -> Result<(String, u64), FsError> {
         let g = self.inner.lock_recover();
-        let ino = *g.handles.get(&fh).ok_or(FsError::BadHandle)?;
+        let handle = g.handles.get(&fh).ok_or(FsError::BadHandle)?;
+        if !handle.read {
+            return Err(FsError::BadHandle);
+        }
+        let node = g.nodes.get(&handle.ino).ok_or(FsError::NotFound)?;
+        if node.kind != FileKind::File {
+            return Err(FsError::IsDir);
+        }
+        Ok((node.path.clone(), node.size))
+    }
+
+    /// Return a handle's read source, preferring its uncommitted write buffer.
+    pub fn read_source(&self, fh: u64, offset: u64, size: u32) -> Result<ReadSource, FsError> {
+        let g = self.inner.lock_recover();
+        let handle = g.handles.get(&fh).ok_or(FsError::BadHandle)?;
+        if !handle.read {
+            return Err(FsError::BadHandle);
+        }
+        let node = g.nodes.get(&handle.ino).ok_or(FsError::NotFound)?;
+        if let Some(dirty) = g.dirty.get(&fh) {
+            let start = usize::try_from(offset).map_err(|_| FsError::Invalid)?;
+            if start >= dirty.buf.len() {
+                return Ok(ReadSource::Buffered(Vec::new()));
+            }
+            let end = start.saturating_add(size as usize).min(dirty.buf.len());
+            return Ok(ReadSource::Buffered(dirty.buf[start..end].to_vec()));
+        }
+        Ok(ReadSource::Backend {
+            path: node.path.clone(),
+            size: node.size,
+        })
+    }
+
+    /// Return the committed object path and size for an inode before opening it.
+    pub fn inode_file_meta(&self, ino: u64) -> Result<(String, u64), FsError> {
+        let g = self.inner.lock_recover();
         let node = g.nodes.get(&ino).ok_or(FsError::NotFound)?;
         if node.kind != FileKind::File {
-            return Err(FsError::Unsupported);
+            return Err(FsError::IsDir);
         }
         Ok((node.path.clone(), node.size))
     }
@@ -303,18 +421,27 @@ impl ReadOnlyFs {
     ///
     /// Inserts a `File` node (size 0) into the namespace and returns
     /// `(attr, fh)` where `fh` is a write handle backed by an empty dirty buffer.
-    /// Fails with [`FsError::NotFound`] if `parent_ino` is not a directory, or
-    /// [`FsError::ReadOnly`] if the name already exists (v1 uses O_TRUNC-style
-    /// whole-object creation; opening an existing file for write is
-    /// [`open_write`](Self::open_write)).
-    pub fn create(&self, parent_ino: u64, name: &str) -> Result<(Attr, u64), FsError> {
+    /// Fails with [`FsError::NotDir`] if `parent_ino` is not a directory or
+    /// [`FsError::Exists`] if the name already exists.
+    pub fn create_with_options(
+        &self,
+        parent_ino: u64,
+        name: &str,
+        options: OpenOptions,
+    ) -> Result<(Attr, u64), FsError> {
+        if !options.read && !options.write {
+            return Err(FsError::Invalid);
+        }
+        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+            return Err(FsError::Invalid);
+        }
         let mut g = self.inner.lock_recover();
         let parent = g.nodes.get(&parent_ino).ok_or(FsError::NotFound)?;
         if parent.kind != FileKind::Directory {
-            return Err(FsError::NotFound);
+            return Err(FsError::NotDir);
         }
         if g.index.contains_key(&(parent_ino, name.to_string())) {
-            return Err(FsError::ReadOnly);
+            return Err(FsError::Exists);
         }
         // Build the child's mount-relative path from its ancestors.
         let path = {
@@ -322,6 +449,7 @@ impl ReadOnlyFs {
             parts.push(name.to_string());
             parts.join("/")
         };
+        path_to_object(&path).map_err(|_| FsError::Invalid)?;
         let ino = g.next_ino;
         g.next_ino += 1;
         let node = Node {
@@ -337,7 +465,17 @@ impl ReadOnlyFs {
         g.nodes.get_mut(&parent_ino).unwrap().children.push(ino);
         let fh = g.next_fh;
         g.next_fh += 1;
-        g.handles.insert(fh, ino);
+        g.handles.insert(
+            fh,
+            Handle {
+                ino,
+                read: options.read,
+                write: options.write,
+                append: options.append,
+            },
+        );
+        // A newly created object must be written through even when opened
+        // read-only and never explicitly written.
         g.dirty.insert(
             fh,
             DirtyFile {
@@ -349,32 +487,17 @@ impl ReadOnlyFs {
         Ok((attr, fh))
     }
 
-    /// Open an existing file `ino` for writing, starting from an empty buffer
-    /// (whole-object rewrite, `O_TRUNC` semantics for v1). Returns a write handle.
-    ///
-    /// In-place edit of existing contents (`O_RDWR` without truncate) would need
-    /// to first fetch the current object into the buffer; that is future work.
-    pub fn open_write(&self, ino: u64) -> Result<u64, FsError> {
-        let mut g = self.inner.lock_recover();
-        let kind = g.nodes.get(&ino).ok_or(FsError::NotFound)?.kind;
-        if kind != FileKind::File {
-            return Err(FsError::Unsupported);
-        }
-        let fh = g.next_fh;
-        g.next_fh += 1;
-        g.handles.insert(fh, ino);
-        g.dirty.insert(
-            fh,
-            DirtyFile {
-                ino,
-                buf: Vec::new(),
+    /// Create a new file opened write-only with an empty whole-object buffer.
+    pub fn create(&self, parent_ino: u64, name: &str) -> Result<(Attr, u64), FsError> {
+        self.create_with_options(
+            parent_ino,
+            name,
+            OpenOptions {
+                read: false,
+                write: true,
+                append: false,
             },
-        );
-        // A truncating open resets the visible size immediately.
-        if let Some(node) = g.nodes.get_mut(&ino) {
-            node.size = 0;
-        }
-        Ok(fh)
+        )
     }
 
     /// `write`: write `data` at `offset` into the write handle's buffer.
@@ -385,9 +508,18 @@ impl ReadOnlyFs {
     /// a handle not opened for write.
     pub fn write(&self, fh: u64, offset: u64, data: &[u8]) -> Result<u32, FsError> {
         let mut g = self.inner.lock_recover();
+        let handle = g.handles.get(&fh).ok_or(FsError::BadHandle)?;
+        if !handle.write {
+            return Err(FsError::BadHandle);
+        }
+        let append = handle.append;
         let dirty = g.dirty.get_mut(&fh).ok_or(FsError::BadHandle)?;
-        let start = offset as usize;
-        let end = start + data.len();
+        let start = if append {
+            dirty.buf.len()
+        } else {
+            usize::try_from(offset).map_err(|_| FsError::Invalid)?
+        };
+        let end = start.checked_add(data.len()).ok_or(FsError::Invalid)?;
         if dirty.buf.len() < end {
             dirty.buf.resize(end, 0);
         }
@@ -403,8 +535,13 @@ impl ReadOnlyFs {
     /// `setattr(size)`: truncate/extend the write handle's buffer to `size`.
     pub fn truncate(&self, fh: u64, size: u64) -> Result<(), FsError> {
         let mut g = self.inner.lock_recover();
+        let handle = g.handles.get(&fh).ok_or(FsError::BadHandle)?;
+        if !handle.write {
+            return Err(FsError::BadHandle);
+        }
         let dirty = g.dirty.get_mut(&fh).ok_or(FsError::BadHandle)?;
-        dirty.buf.resize(size as usize, 0);
+        let buffer_size = usize::try_from(size).map_err(|_| FsError::Invalid)?;
+        dirty.buf.resize(buffer_size, 0);
         let ino = dirty.ino;
         if let Some(node) = g.nodes.get_mut(&ino) {
             node.size = size;
@@ -502,6 +639,12 @@ mod tests {
         fs
     }
 
+    fn data_dir(fs: &ReadOnlyFs) -> Attr {
+        let s3 = fs.lookup(ROOT_INO, "s3").unwrap();
+        let bucket = fs.lookup(s3.ino, "bucket").unwrap();
+        fs.lookup(bucket.ino, "data").unwrap()
+    }
+
     #[test]
     fn lookup_and_getattr_walk_the_tree() {
         let fs = fs();
@@ -543,7 +686,7 @@ mod tests {
         let a = fs.lookup(data.ino, "a.bin").unwrap();
 
         // Cannot open a directory.
-        assert_eq!(fs.open(data.ino), Err(FsError::Unsupported));
+        assert_eq!(fs.open(data.ino), Err(FsError::IsDir));
 
         let fh = fs.open(a.ino).unwrap();
         // file_meta yields the object path + size for the open handle.
@@ -641,8 +784,8 @@ mod tests {
 
     #[test]
     fn write_past_end_extends_with_zeros() {
-        let fs = ReadOnlyFs::new();
-        let (_, fh) = fs.create(ROOT_INO, "sparse.bin").unwrap();
+        let fs = fs();
+        let (_, fh) = fs.create(data_dir(&fs).ino, "sparse.bin").unwrap();
         // Write at offset 5 with nothing before → bytes 0..5 are zero-filled.
         fs.write(fh, 5, b"XY").unwrap();
         assert_eq!(fs.dirty_bytes(fh).unwrap(), vec![0, 0, 0, 0, 0, b'X', b'Y']);
@@ -650,8 +793,8 @@ mod tests {
 
     #[test]
     fn truncate_resizes_buffer_and_size() {
-        let fs = ReadOnlyFs::new();
-        let (attr, fh) = fs.create(ROOT_INO, "t.bin").unwrap();
+        let fs = fs();
+        let (attr, fh) = fs.create(data_dir(&fs).ino, "t.bin").unwrap();
         fs.write(fh, 0, b"0123456789").unwrap();
         fs.truncate(fh, 4).unwrap();
         assert_eq!(fs.dirty_bytes(fh).unwrap(), b"0123");
@@ -683,8 +826,8 @@ mod tests {
 
     #[test]
     fn write_and_release_handle_lifecycle() {
-        let fs = ReadOnlyFs::new();
-        let (_, fh) = fs.create(ROOT_INO, "x.bin").unwrap();
+        let fs = fs();
+        let (_, fh) = fs.create(data_dir(&fs).ino, "x.bin").unwrap();
         assert!(fs.dirty_bytes(fh).is_some());
         fs.release(fh).unwrap();
         // After release the write buffer is gone.
@@ -699,7 +842,82 @@ mod tests {
             .lookup(fs.lookup(ROOT_INO, "s3").unwrap().ino, "bucket")
             .unwrap();
         let dir = fs.lookup(bucket.ino, "data").unwrap();
-        assert_eq!(fs.create(dir.ino, "a.bin"), Err(FsError::ReadOnly));
+        assert_eq!(fs.create(dir.ino, "a.bin"), Err(FsError::Exists));
+    }
+
+    #[test]
+    fn non_truncating_write_open_preserves_existing_contents() {
+        let fs = fs();
+        let file = fs.lookup(data_dir(&fs).ino, "a.bin").unwrap();
+        let fh = fs
+            .open_with_options(
+                file.ino,
+                OpenOptions {
+                    read: true,
+                    write: true,
+                    append: false,
+                },
+                Some(b"existing".to_vec()),
+            )
+            .unwrap();
+
+        fs.write(fh, 3, b"XYZ").unwrap();
+        assert_eq!(fs.dirty_bytes(fh).unwrap(), b"exiXYZng");
+        assert_eq!(
+            fs.read_source(fh, 0, 8).unwrap(),
+            ReadSource::Buffered(b"exiXYZng".to_vec())
+        );
+    }
+
+    #[test]
+    fn append_handle_ignores_the_supplied_offset() {
+        let fs = fs();
+        let file = fs.lookup(data_dir(&fs).ino, "a.bin").unwrap();
+        let fh = fs
+            .open_with_options(
+                file.ino,
+                OpenOptions {
+                    read: false,
+                    write: true,
+                    append: true,
+                },
+                Some(b"base".to_vec()),
+            )
+            .unwrap();
+
+        fs.write(fh, 0, b"-tail").unwrap();
+        assert_eq!(fs.dirty_bytes(fh).unwrap(), b"base-tail");
+        assert_eq!(fs.read_source(fh, 0, 32), Err(FsError::BadHandle));
+    }
+
+    #[test]
+    fn read_only_truncating_open_mutates_but_does_not_allow_write() {
+        let fs = fs();
+        let file = fs.lookup(data_dir(&fs).ino, "a.bin").unwrap();
+        let fh = fs
+            .open_with_options(
+                file.ino,
+                OpenOptions {
+                    read: true,
+                    write: false,
+                    append: false,
+                },
+                Some(Vec::new()),
+            )
+            .unwrap();
+
+        assert_eq!(
+            fs.read_source(fh, 0, 32).unwrap(),
+            ReadSource::Buffered(Vec::new())
+        );
+        assert_eq!(fs.write(fh, 0, b"x"), Err(FsError::BadHandle));
+        assert_eq!(fs.dirty_bytes(fh).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn create_rejects_paths_without_backend_and_bucket() {
+        let fs = ReadOnlyFs::new();
+        assert_eq!(fs.create(ROOT_INO, "orphan.bin"), Err(FsError::Invalid));
     }
 
     /// The namespace lives behind a single Mutex, so with `lock().unwrap()` one
